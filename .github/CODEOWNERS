@@ -1,0 +1,7 @@
+# This file is required by Wire's security team as part of their project against dead forks.
+# However, it is not desired or relevant in the upstream repo.
+# Therefore, the commit adding this file must always be the final commit in the repo,
+# and `master` must be adjusted to ensure that property before attempting to upstream anything.
+
+# In this case everything belongs to the core-libraries team
+*   @wireapp/core-libraries
