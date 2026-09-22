@@ -167,9 +167,30 @@ jobs:
         rustup target add wasm32-unknown-unknown
         cargo check -p sqlite-wasm-vfs --lib --target wasm32-unknown-unknown --no-default-features
         cargo check -p sqlite-wasm-vfs --lib --target wasm32-unknown-unknown --features sahpool
+        cargo check -p sqlite-wasm-vfs --lib --target wasm32-unknown-unknown --features opfs-jspi
+        cargo check -p sqlite-wasm-vfs --lib --target wasm32-unknown-unknown --all-features
     - name: Test SAH pool in a dedicated worker
       working-directory: crates/sqlite-wasm-vfs
       run: wasm-pack test --chrome --headless --features sahpool
+
+  test_opfs_jspi:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: browser-actions/setup-chrome@v2
+      id: chrome
+      with:
+        chrome-version: stable
+        install-chromedriver: true
+    - name: Install wasm-pack
+      run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+    - name: Build main-thread JSPI example
+      run: wasm-pack build --target web examples/opfs-jspi
+    - name: Test OPFS and interrupted-commit recovery on Window
+      env:
+        CHROME_BIN: ${{ steps.chrome.outputs.chrome-path }}
+        CHROMEDRIVER: ${{ steps.chrome.outputs.chromedriver-path }}
+      run: node examples/opfs-jspi/run.mjs
 
   test_vfs_native:
     runs-on: ubuntu-latest
