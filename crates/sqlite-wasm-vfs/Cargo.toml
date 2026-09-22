@@ -12,6 +12,13 @@ categories = ["development-tools::ffi", "wasm", "database"]
 keywords = ["sqlite", "sqlite-wasm", "wasm", "webassembly", "javascript"]
 
 [features]
+opfs-jspi = [
+  "dep:rsqlite-vfs",
+  "dep:wasm-bindgen",
+  "dep:js-sys",
+  "dep:thiserror",
+  "dep:async-lock",
+]
 sahpool = [
   "dep:rsqlite-vfs",
   "dep:wasm-bindgen",
@@ -28,6 +35,7 @@ wasm-bindgen = { version = "0.2.128", default-features = false, optional = true 
 js-sys = { version = "0.3.105", default-features = false, features = ["std"], optional = true }
 futures-util = { version = "0.3.34", default-features = false, features = ["std"], optional = true }
 thiserror = { version = "2.0.20", default-features = false, optional = true }
+async-lock = { version = "3.4", default-features = false, optional = true }
 web-sys = { version = "0.3.105", default-features = false, optional = true, features = [
   "StorageManager",
   "FileSystemSyncAccessHandle",
