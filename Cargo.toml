@@ -53,6 +53,7 @@ members = [
   "crates/sqlite-wasm-vfs",
   "extensions/sqlite-vec",
   "examples/nodejs",
+  "examples/opfs-jspi",
   "examples/use-prebuild-lib",
 ]
 

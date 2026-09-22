@@ -1,0 +1,58 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>SQLite OPFS + JSPI</title>
+<h1>SQLite OPFS + JSPI</h1>
+<p>Runs SQLite directly on the main thread. No worker is created.</p>
+<pre id="result">Running…</pre>
+<script type="module">
+import init, { run_tests, prepare_guard_connections, guarded_wait, take_guard_order, finish_guard_connections, enqueue_cleanup_probe, take_cleanup_order, prepare_deferred_rollback, drop_deferred_rollback, finish_deferred_rollback, prepare_recovery_test, finish_recovery_test, prepare_wal_recovery_test, finish_wal_recovery_test } from './pkg/opfs_jspi_example.js';
+try {
+    await init();
+    let ticks = 0;
+    const timer = setInterval(() => { ticks++; }, 0);
+    try {
+        let recovery = '';
+        if (sessionStorage.getItem('jspi-recovery') === 'pending') {
+            sessionStorage.removeItem('jspi-recovery');
+            await finish_recovery_test();
+            document.querySelector('#result').textContent = 'Testing interrupted WAL checkpoint…';
+            await prepare_wal_recovery_test();
+            throw new Error('WAL recovery hook did not reload');
+        } else if (sessionStorage.getItem('jspi-recovery') === 'wal-pending') {
+            sessionStorage.removeItem('jspi-recovery');
+            recovery = await finish_wal_recovery_test();
+        }
+        await prepare_guard_connections();
+        const first = guarded_wait('first', 40);
+        await Promise.resolve();
+        const second = guarded_wait('second', 0);
+        await Promise.all([first, second]);
+        const guardOrder = await take_guard_order();
+        if (guardOrder !== 'enter-first,exit-first,enter-second,exit-second') {
+            throw new Error(`guard did not serialize suspended operations: ${guardOrder}`);
+        }
+        await finish_guard_connections();
+        enqueue_cleanup_probe();
+        const cleanupOrder = await take_cleanup_order();
+        if (cleanupOrder !== 'outer,inner') {
+            throw new Error(`deferred cleanup ordering failed: ${cleanupOrder}`);
+        }
+        await prepare_deferred_rollback();
+        drop_deferred_rollback();
+        await finish_deferred_rollback();
+        const result = await run_tests();
+        if (!recovery) {
+            document.querySelector('#result').textContent = result + '\nTesting interrupted commit…';
+            await prepare_recovery_test();
+            throw new Error('recovery hook did not reload');
+        }
+        if (!ticks) throw new Error('event loop did not run during suspended I/O');
+        document.querySelector('#result').textContent = `${result}\nPASS: queued guard contention and nested deferred cleanup\n${recovery}\nEvent loop ticks during I/O: ${ticks}`;
+        document.documentElement.dataset.result = 'passed';
+    } finally { clearInterval(timer); }
+} catch (error) {
+    document.querySelector('#result').textContent = `FAIL: ${error?.stack || error}`;
+    document.documentElement.dataset.result = 'failed';
+    console.error(error);
+}
+</script>
