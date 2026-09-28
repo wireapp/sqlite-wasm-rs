@@ -6,6 +6,9 @@
 <pre id="result">Running…</pre>
 <script type="module">
 import init, { run_tests, prepare_guard_connections, guarded_wait, take_guard_order, finish_guard_connections, enqueue_cleanup_probe, take_cleanup_order, prepare_deferred_rollback, drop_deferred_rollback, finish_deferred_rollback, prepare_recovery_test, finish_recovery_test, prepare_wal_recovery_test, finish_wal_recovery_test } from './pkg/opfs_jspi_example.js';
+if (new URLSearchParams(location.search).has('metrics')) {
+    globalThis.__sqliteWasmVfsMetrics = [];
+}
 try {
     await init();
     let ticks = 0;

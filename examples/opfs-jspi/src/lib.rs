@@ -100,6 +100,7 @@ pub fn run_tests() -> Result<String, JsValue> {
     )
     .map_err(js_error)?;
     file_contract_tests();
+    cache_contract_tests();
     assert!(Db::open("../invalid").is_err());
     for mode in ["DELETE", "TRUNCATE", "PERSIST", "WAL"] {
         let name = format!("{mode}.db");
@@ -191,11 +192,21 @@ pub fn run_tests() -> Result<String, JsValue> {
     unsafe {
         vfs.uninstall().map_err(js_error)?;
     }
-    Ok("PASS: indexed byte I/O, sparse/overlap/truncation, create/write/truncate/close errors, scoped and super-journal barriers, read-only, delete-on-close, main-thread SQLite, DELETE/TRUNCATE/PERSIST/WAL, checkpoint, rollback, reopen, integrity, duplicate opens, directory lease, uninstall/reinstall".into())
+    Ok("PASS: indexed byte I/O, cache preservation, sparse/overlap/truncation, create/write/truncate/close errors, scoped and super-journal barriers, read-only, delete-on-close, main-thread SQLite, DELETE/TRUNCATE/PERSIST/WAL, checkpoint, rollback, reopen, integrity, duplicate opens, directory lease, uninstall/reinstall".into())
 }
 
 #[wasm_bindgen(module = "/test-hooks.js")]
 extern "C" {
+    #[wasm_bindgen(js_name = startVfsMetrics)]
+    fn start_vfs_metrics();
+    #[wasm_bindgen(js_name = takeVfsMetricOperations)]
+    fn take_vfs_metric_operations() -> String;
+    #[wasm_bindgen(js_name = startColdReadCount)]
+    fn start_cold_read_count();
+    #[wasm_bindgen(js_name = takeColdReadCount)]
+    fn take_cold_read_count() -> u32;
+    #[wasm_bindgen(js_name = stopColdReadCount)]
+    fn stop_cold_read_count();
     #[wasm_bindgen(js_name = failNextWrite)]
     fn fail_next_write();
     #[wasm_bindgen(js_name = failFileCreation)]
@@ -321,6 +332,183 @@ pub fn finish_deferred_rollback() -> Result<(), JsValue> {
     vfs.remove("deferred.db").map_err(js_error)?;
     unsafe { vfs.uninstall().map_err(js_error)? };
     Ok(())
+}
+
+fn cache_contract_tests() {
+    use rsqlite_vfs::ffi::*;
+    use std::mem::MaybeUninit;
+
+    const BLOCK: usize = 64 * 1024;
+    unsafe {
+        start_vfs_metrics();
+        let vfs = sqlite3_vfs_find(c"jspi-example".as_ptr());
+        let mut storage = Box::new(MaybeUninit::<rsqlite_vfs::SQLiteVfsFile>::zeroed());
+        let file: *mut sqlite3_file = storage.as_mut_ptr().cast();
+        let mut actual = 0;
+        assert_eq!(
+            (*vfs).xOpen.unwrap()(
+                vfs,
+                c"cache-contract".as_ptr(),
+                file,
+                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_MAIN_JOURNAL,
+                &mut actual,
+            ),
+            SQLITE_OK
+        );
+        let methods = &*(*file).pMethods;
+        let write = methods.xWrite.unwrap();
+        let read = methods.xRead.unwrap();
+        let sync = methods.xSync.unwrap();
+        let truncate = methods.xTruncate.unwrap();
+        let mut initial = vec![0u8; BLOCK * 3];
+        for (index, block) in initial.chunks_mut(BLOCK).enumerate() {
+            block.fill(index as u8 + 1);
+        }
+        assert_eq!(
+            write(file, initial.as_ptr().cast(), initial.len() as i32, 0),
+            SQLITE_OK
+        );
+        assert_eq!(sync(file, SQLITE_SYNC_FULL), SQLITE_OK);
+
+        start_cold_read_count();
+        let mut byte = [0u8; 1];
+        for (index, offset) in [0, BLOCK, BLOCK * 2].into_iter().enumerate() {
+            assert_eq!(
+                read(file, byte.as_mut_ptr().cast(), 1, offset as i64),
+                SQLITE_OK
+            );
+            assert_eq!(byte[0], index as u8 + 1);
+        }
+        assert_eq!(take_cold_read_count(), 3);
+
+        assert_eq!(
+            write(file, b"Z".as_ptr().cast(), 1, (BLOCK + 10) as i64),
+            SQLITE_OK
+        );
+        assert_eq!(sync(file, SQLITE_SYNC_FULL), SQLITE_OK);
+        for offset in [0, BLOCK + 10, BLOCK * 2] {
+            assert_eq!(
+                read(file, byte.as_mut_ptr().cast(), 1, offset as i64),
+                SQLITE_OK
+            );
+        }
+        assert_eq!(byte, [3]);
+        assert_eq!(
+            take_cold_read_count(),
+            1,
+            "only the changed block should be cold"
+        );
+
+        assert_eq!(
+            write(file, b"XY".as_ptr().cast(), 2, (BLOCK - 1) as i64),
+            SQLITE_OK
+        );
+        assert_eq!(sync(file, SQLITE_SYNC_FULL), SQLITE_OK);
+        for offset in [BLOCK - 1, BLOCK, BLOCK * 2] {
+            assert_eq!(
+                read(file, byte.as_mut_ptr().cast(), 1, offset as i64),
+                SQLITE_OK
+            );
+        }
+        assert_eq!(
+            take_cold_read_count(),
+            2,
+            "a boundary write changes two blocks"
+        );
+
+        assert_eq!(truncate(file, (BLOCK * 2 + 10) as i64), SQLITE_OK);
+        assert_eq!(sync(file, SQLITE_SYNC_FULL), SQLITE_OK);
+        assert_eq!(
+            read(file, byte.as_mut_ptr().cast(), 1, (BLOCK * 2) as i64),
+            SQLITE_OK
+        );
+        assert_eq!(take_cold_read_count(), 1);
+        assert_eq!(
+            write(file, b"Q".as_ptr().cast(), 1, (BLOCK * 2 + 15) as i64),
+            SQLITE_OK
+        );
+        assert_eq!(sync(file, SQLITE_SYNC_FULL), SQLITE_OK);
+        let mut tail = [255u8; 16];
+        assert_eq!(
+            read(file, tail.as_mut_ptr().cast(), 16, (BLOCK * 2) as i64),
+            SQLITE_OK
+        );
+        assert_eq!(tail, [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, b'Q']);
+        assert_eq!(
+            take_cold_read_count(),
+            1,
+            "the old partial EOF block must be evicted"
+        );
+
+        assert_eq!(truncate(file, (BLOCK * 2 + 1) as i64), SQLITE_OK);
+        assert_eq!(truncate(file, (BLOCK * 2 + 16) as i64), SQLITE_OK);
+        assert_eq!(
+            write(file, b"R".as_ptr().cast(), 1, (BLOCK * 2 + 15) as i64),
+            SQLITE_OK
+        );
+        assert_eq!(sync(file, SQLITE_SYNC_FULL), SQLITE_OK);
+        assert_eq!(
+            read(file, tail.as_mut_ptr().cast(), 16, (BLOCK * 2) as i64),
+            SQLITE_OK
+        );
+        assert_eq!(tail, [3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, b'R']);
+        assert_eq!(
+            take_cold_read_count(),
+            1,
+            "shrink then regrow must evict the tail"
+        );
+
+        assert_eq!(truncate(file, (BLOCK * 32) as i64), SQLITE_OK);
+        assert_eq!(sync(file, SQLITE_SYNC_FULL), SQLITE_OK);
+        assert_eq!(read(file, byte.as_mut_ptr().cast(), 1, 0), SQLITE_OK);
+        assert_eq!(
+            read(file, byte.as_mut_ptr().cast(), 1, BLOCK as i64),
+            SQLITE_OK
+        );
+        take_cold_read_count();
+        let large = vec![9u8; 1024 * 1024];
+        assert_eq!(
+            write(
+                file,
+                large.as_ptr().cast(),
+                large.len() as i32,
+                (BLOCK * 4) as i64
+            ),
+            SQLITE_OK
+        );
+        assert_eq!(sync(file, SQLITE_SYNC_FULL), SQLITE_OK);
+        assert_eq!(read(file, byte.as_mut_ptr().cast(), 1, 0), SQLITE_OK);
+        assert_eq!(byte, [1]);
+        assert_eq!(
+            read(file, byte.as_mut_ptr().cast(), 1, BLOCK as i64),
+            SQLITE_OK
+        );
+        assert_eq!(byte, [b'Y']);
+        assert_eq!(
+            take_cold_read_count(),
+            0,
+            "submission before sync must retain unaffected blocks"
+        );
+        stop_cold_read_count();
+
+        assert_eq!(methods.xClose.unwrap()(file), SQLITE_OK);
+        assert_eq!(
+            (*vfs).xDelete.unwrap()(vfs, c"cache-contract".as_ptr(), 1),
+            SQLITE_OK
+        );
+        let metrics = take_vfs_metric_operations();
+        for operation in [
+            "streamCreate",
+            "streamWrite",
+            "streamTruncate",
+            "streamClose",
+            "readSnapshot",
+            "cacheMiss",
+            "publish:sync",
+        ] {
+            assert!(metrics.contains(operation), "missing {operation} metric");
+        }
+    }
 }
 
 // Exercise the actual SQLite callback table, including byte-level contracts

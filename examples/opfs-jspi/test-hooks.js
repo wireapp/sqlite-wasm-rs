@@ -1,4 +1,42 @@
 // Test-only fault injection. Never included in the VFS package.
+let originalArrayBuffer;
+let coldReads = 0;
+let metricStartIndex = 0;
+let ownsMetricCollector = false;
+
+export function startVfsMetrics() {
+    ownsMetricCollector = !Array.isArray(globalThis.__sqliteWasmVfsMetrics);
+    if (ownsMetricCollector) globalThis.__sqliteWasmVfsMetrics = [];
+    metricStartIndex = globalThis.__sqliteWasmVfsMetrics.length;
+}
+
+export function takeVfsMetricOperations() {
+    const samples = globalThis.__sqliteWasmVfsMetrics.slice(metricStartIndex);
+    if (ownsMetricCollector) delete globalThis.__sqliteWasmVfsMetrics;
+    return samples.map(sample => sample.operation + (sample.reason ? ':' + sample.reason : '')).join(',');
+}
+
+export function startColdReadCount() {
+    if (originalArrayBuffer) throw new Error('cold read counter already started');
+    coldReads = 0;
+    originalArrayBuffer = Blob.prototype.arrayBuffer;
+    Blob.prototype.arrayBuffer = function (...args) {
+        coldReads++;
+        return originalArrayBuffer.apply(this, args);
+    };
+}
+
+export function takeColdReadCount() {
+    const count = coldReads;
+    coldReads = 0;
+    return count;
+}
+
+export function stopColdReadCount() {
+    Blob.prototype.arrayBuffer = originalArrayBuffer;
+    originalArrayBuffer = undefined;
+}
+
 export function failNextWrite() {
     const original = FileSystemFileHandle.prototype.createWritable;
     FileSystemFileHandle.prototype.createWritable = function (...args) {

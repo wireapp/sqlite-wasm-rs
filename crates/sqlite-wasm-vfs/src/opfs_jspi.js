@@ -33,6 +33,23 @@ export async function acquire(directory) {
 
 export function release(lease) { lease.release(); return lease.finished; }
 
+// Opt-in, in-memory I/O samples. Callers set this to an array and read it once
+// after timing; samples contain sizes and roles, never file contents or names.
+function metricStart() {
+    return Array.isArray(globalThis.__sqliteWasmVfsMetrics) ? performance.now() : undefined;
+}
+
+function recordMetric(state, operation, started, details = {}) {
+    if (started === undefined) return;
+    const samples = globalThis.__sqliteWasmVfsMetrics;
+    if (Array.isArray(samples)) {
+        // Measurement must never change the outcome of a SQLite I/O call.
+        try {
+            samples.push({ operation, role: state.role, durationMs: performance.now() - started, ...details });
+        } catch (_) { /* ignore a broken optional collector */ }
+    }
+}
+
 export async function open(lease, name, create, exclusive, role, group) {
     if (exclusive && await exists(lease, name)) {
         throw new DOMException('File already exists', 'InvalidModificationError');
@@ -46,6 +63,7 @@ export async function open(lease, name, create, exclusive, role, group) {
         baseLimit: file.size, logicalSize: file.size,
         stagedSize: file.size, segments: [], dirty: [],
         sizeDirty: false, shrinkFloor: undefined,
+        publicationChanges: [], publicationTailFloor: undefined,
         cache: new Map(), cacheBytes: 0,
     };
     lease.metadata.set(name, { role, group });
@@ -73,10 +91,10 @@ function isSidecar(state) {
 
 async function deletionBarrier(lease, metadata) {
     if (!metadata || metadata.role === 'super-journal' || !metadata.group) {
-        await publishAll(lease);
+        await publishAll(lease, () => true, 'deletion');
         return;
     }
-    await publishAll(lease, state => state.group === metadata.group);
+    await publishAll(lease, state => state.group === metadata.group, 'deletion');
 }
 
 export async function remove(lease, name) {
@@ -94,7 +112,14 @@ function check(state) {
 async function ensureStream(state) {
     check(state);
     if (!state.stream) {
-        state.stream = await state.fileHandle.createWritable({ keepExistingData: true });
+        const started = metricStart();
+        try {
+            state.stream = await state.fileHandle.createWritable({ keepExistingData: true });
+            recordMetric(state, 'streamCreate', started, { logicalSize: state.logicalSize, success: true });
+        } catch (error) {
+            recordMetric(state, 'streamCreate', started, { logicalSize: state.logicalSize, success: false });
+            throw error;
+        }
     }
     return state.stream;
 }
@@ -197,16 +222,22 @@ async function submit(state) {
         const stream = await ensureStream(state);
         let stagedSize = state.stagedSize;
         if (state.shrinkFloor !== undefined) {
+            const started = metricStart();
             await stream.truncate(state.shrinkFloor);
+            recordMetric(state, 'streamTruncate', started, { length: state.shrinkFloor });
             stagedSize = state.shrinkFloor;
         }
         if (state.sizeDirty && stagedSize !== state.logicalSize) {
+            const started = metricStart();
             await stream.truncate(state.logicalSize);
+            recordMetric(state, 'streamTruncate', started, { length: state.logicalSize });
             stagedSize = state.logicalSize;
         }
         for (const range of state.dirty) {
             const bytes = materialize(state, range.start, range.end);
+            const started = metricStart();
             await stream.write({ type: 'write', position: range.start, data: bytes });
+            recordMetric(state, 'streamWrite', started, { bytes: bytes.byteLength });
             stagedSize = Math.max(stagedSize, range.end);
         }
         state.stagedSize = state.logicalSize;
@@ -227,40 +258,69 @@ function clearCache(state) {
     state.cacheBytes = 0;
 }
 
-async function publish(state) {
+function invalidatePublishedCache(state) {
+    const blockSize = globalThis.__sqliteWasmVfsReadBlockSize ?? 64 * 1024;
+    let evicted = 0;
+    for (const [start, block] of state.cache) {
+        const end = start + blockSize;
+        if ((state.publicationTailFloor !== undefined && end > state.publicationTailFloor) ||
+            state.publicationChanges.some(range => start < range.end && end > range.start)) {
+            state.cache.delete(start);
+            state.cacheBytes -= block.byteLength;
+            evicted++;
+        }
+    }
+    return evicted;
+}
+
+async function publish(state, reason) {
     check(state);
     if (!hasPending(state)) return;
+    const started = metricStart();
     await submit(state);
     const stream = state.stream;
     if (!stream) return;
+    const closeStarted = metricStart();
+    let closed = false;
     try {
         await stream.close();
+        closed = true;
+        recordMetric(state, 'streamClose', closeStarted, { success: true });
         state.stream = undefined;
         state.baseLimit = state.logicalSize;
         state.stagedSize = state.logicalSize;
         state.file = undefined;
-        clearCache(state);
+        const evictedBlocks = invalidatePublishedCache(state);
+        recordMetric(state, 'publish', started, {
+            reason, logicalSize: state.logicalSize,
+            dirtyBytes: state.publicationChanges.reduce((sum, range) => sum + range.end - range.start, 0),
+            touchedChunks: null, evictedBlocks, cacheBytes: state.cacheBytes,
+        });
+        state.publicationChanges = [];
+        state.publicationTailFloor = undefined;
         state.segments = [];
     } catch (error) {
+        if (!closed) recordMetric(state, 'streamClose', closeStarted, { success: false });
+        recordMetric(state, 'publish', started, { reason, logicalSize: state.logicalSize, success: false });
         await poison(state, error);
     }
 }
 
-async function publishAll(lease, predicate = () => true) {
+async function publishAll(lease, predicate = () => true, reason = 'barrier') {
     for (const state of lease.files) {
-        if (hasPending(state) && predicate(state)) await publish(state);
+        if (hasPending(state) && predicate(state)) await publish(state, reason);
     }
 }
 
 async function phaseBarrier(state) {
     if (state.role === 'super-journal') {
-        await publishAll(state.lease);
+        await publishAll(state.lease, () => true, 'phase');
     } else if ((state.role === 'database' || isSidecar(state)) && !state.group) {
-        await publishAll(state.lease, other => state.role === 'database' ? isSidecar(other) : other.role === 'database');
+        await publishAll(state.lease, other => state.role === 'database' ? isSidecar(other) : other.role === 'database', 'phase');
     } else if (state.role === 'database') {
-        await publishAll(state.lease, other => sameGroup(state, other) && isSidecar(other));
+        await publishAll(state.lease, other => sameGroup(state, other) && isSidecar(other), 'phase');
     } else if (isSidecar(state)) {
-        await publishAll(state.lease, other => sameGroup(state, other) && other.role === 'database');
+        await publishAll(state.lease, other => sameGroup(state, other) && other.role === 'database', 'phase');
     }
 }
 
@@ -281,7 +341,11 @@ function missingBaseRanges(state, start, end) {
 }
 
 async function readPublished(state, target, start, end, targetOffset) {
-    state.file ??= await state.fileHandle.getFile();
+    if (!state.file) {
+        const started = metricStart();
+        state.file = await state.fileHandle.getFile();
+        recordMetric(state, 'readSnapshot', started, { logicalSize: state.baseLimit });
+    }
     const blockSize = globalThis.__sqliteWasmVfsReadBlockSize ?? 64 * 1024;
     const cacheLimit = globalThis.__sqliteWasmVfsReadCacheBytes ?? 8 * 1024 * 1024;
     for (let blockStart = Math.floor(start / blockSize) * blockSize;
@@ -292,7 +356,9 @@ async function readPublished(state, target, start, end, targetOffset) {
             state.cache.set(blockStart, block);
         } else {
             const blockEnd = Math.min(state.baseLimit, blockStart + blockSize);
+            const started = metricStart();
             block = new Uint8Array(await state.file.slice(blockStart, blockEnd).arrayBuffer());
+            recordMetric(state, 'cacheMiss', started, { bytes: block.byteLength, cacheBytes: state.cacheBytes });
             while (state.cacheBytes + block.byteLength > cacheLimit && state.cache.size) {
                 const oldest = state.cache.keys().next().value;
                 const removed = state.cache.get(oldest).byteLength;
@@ -312,8 +378,12 @@ async function readPublished(state, target, start, end, targetOffset) {
 
 export async function read(state, offset, length) {
     check(state);
+    const started = metricStart();
     const count = Math.max(0, Math.min(length, state.logicalSize - offset));
-    if (!count) return new Uint8Array();
+    if (!count) {
+        recordMetric(state, 'read', started, { bytes: 0 });
+        return new Uint8Array();
+    }
     const end = offset + count;
     const bytes = new Uint8Array(count);
     const missing = missingBaseRanges(state, offset, end);
@@ -328,6 +398,7 @@ export async function read(state, offset, length) {
         const to = Math.min(end, segmentEnd);
         bytes.set(segment.bytes.subarray(from - segment.start, to - segment.start), from - offset);
     }
+    recordMetric(state, 'read', started, { bytes: count });
     return bytes;
 }
 
@@ -344,6 +415,10 @@ export async function write(state, offset, bytes) {
     try {
         replaceSegment(state, offset, bytes);
         state.dirty = intervalUnion(state.dirty, offset, offset + bytes.byteLength);
+        state.publicationChanges = intervalUnion(state.publicationChanges, offset, offset + bytes.byteLength);
+        if (offset + bytes.byteLength > state.logicalSize) {
+            state.publicationTailFloor = Math.min(state.publicationTailFloor ?? state.logicalSize, state.logicalSize);
+        }
         state.logicalSize = Math.max(state.logicalSize, offset + bytes.byteLength);
         if (dirtyBytes(state) >= 1024 * 1024) await submit(state);
     } catch (error) {
@@ -358,10 +433,14 @@ export async function truncate(state, length) {
     await phaseBarrier(state);
     try {
         if (length < state.logicalSize) {
+            state.publicationTailFloor = Math.min(state.publicationTailFloor ?? length, length);
             state.baseLimit = Math.min(state.baseLimit, length);
             state.shrinkFloor = Math.min(state.shrinkFloor ?? length, length);
             truncateSegments(state, length);
             state.dirty = clipIntervals(state.dirty, length);
+        }
+        if (length > state.logicalSize) {
+            state.publicationTailFloor = Math.min(state.publicationTailFloor ?? state.logicalSize, state.logicalSize);
         }
         state.logicalSize = length;
         state.sizeDirty = true;
@@ -372,12 +451,12 @@ export async function truncate(state, length) {
     }
 }
 
-export function sync(state) { return publish(state); }
+export function sync(state) { return publish(state, 'sync'); }
 
 export async function close(state) {
     try {
         await phaseBarrier(state);
-        await publish(state);
+        await publish(state, 'close');
     } finally {
         state.segments = [];
         clearCache(state);

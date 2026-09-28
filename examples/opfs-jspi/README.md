@@ -45,3 +45,11 @@ WAL uses a persistent OPFS `-wal` file and SQLite's heap-memory index. Each
 connection sets `PRAGMA locking_mode=EXCLUSIVE` before database access, including
 on reopen. No `-shm` file or shared-memory callbacks are needed. Directory
 ownership and the single-connection rule remain required.
+
+# VFS I/O samples
+
+Open the example with `?metrics=1` to collect opt-in VFS samples in
+`globalThis.__sqliteWasmVfsMetrics`. Read the array after the test completes;
+sampling itself does not log during timed operations. Each sample records an
+operation, duration, file role, and relevant sizes. It contains no file names
+or file contents. `touchedChunks` is `null` for this whole-file backend.
