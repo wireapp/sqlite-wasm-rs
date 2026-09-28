@@ -23,6 +23,13 @@ export function takeVfsMetricOutcomes() {
         (sample.reason ? ':' + sample.reason : '') + ':' + sample.success).join(',');
 }
 
+export function takeWorkerPublishedBytes() {
+    const samples = globalThis.__sqliteWasmVfsMetrics.slice(metricStartIndex);
+    if (ownsMetricCollector) delete globalThis.__sqliteWasmVfsMetrics;
+    return samples.filter(sample => sample.operation === 'publish' && sample.success)
+        .reduce((total, sample) => total + sample.dirtyBytes, 0);
+}
+
 export function startColdReadCount() {
     if (originalArrayBuffer) throw new Error('cold read counter already started');
     coldReads = 0;
@@ -97,6 +104,22 @@ export function crashAfterDatabaseWrite() {
 
 export function crashDuringWalCheckpoint() {
     crashAfterWrite('wal-recovery.db', 'wal-pending');
+}
+
+export function crashAfterWorkerDatabasePublish(stage) {
+    globalThis.__sqliteWasmVfsCrashWorkerDatabasePublish = stage;
+}
+
+export function failWorkerWalTruncate() {
+    globalThis.__sqliteWasmVfsFailWalTruncate = true;
+    globalThis.__sqliteWasmVfsWalTruncateFired = false;
+}
+
+export function takeWorkerWalTruncateFired() {
+    const fired = !!globalThis.__sqliteWasmVfsWalTruncateFired;
+    delete globalThis.__sqliteWasmVfsFailWalTruncate;
+    delete globalThis.__sqliteWasmVfsWalTruncateFired;
+    return fired;
 }
 
 function crashAfterWrite(name, stage) {

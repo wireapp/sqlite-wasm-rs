@@ -40,6 +40,15 @@ From a `#[wasm_bindgen(jspi)]` export, install with
 Keep the returned `OpfsJspi` for explicit uninstallation. Open databases using
 that VFS name. JavaScript must await the exported operation.
 
+An experimental `install_worker` option keeps SQLite on the calling thread and
+sends OPFS I/O to a dedicated worker with synchronous access handles. It uses a
+separate `worker-v1` subdirectory under the same Web Lock. Select it only for a
+fresh store: installation rejects legacy `f-` files because migration and a
+downgrade gate are not implemented. The worker is created from a Blob URL, so
+the page's Content Security Policy must allow Blob workers. This option has a
+different, in-place write and flush persistence model from the writable-stream
+backend and is not yet a transparent replacement for existing stores.
+
 **Guard every complete SQLite operation in the wasm instance** with
 `opfs_jspi::SqliteGuard`, including operations using other VFSes, connection
 open/close, statement preparation/stepping/finalization, and VFS lifecycle and

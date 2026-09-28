@@ -5,7 +5,7 @@
 <p>Runs SQLite directly on the main thread. No worker is created.</p>
 <pre id="result">Running…</pre>
 <script type="module">
-import init, { run_tests, prepare_guard_connections, guarded_wait, take_guard_order, finish_guard_connections, enqueue_cleanup_probe, take_cleanup_order, prepare_deferred_rollback, drop_deferred_rollback, finish_deferred_rollback, prepare_recovery_test, finish_recovery_test, prepare_wal_recovery_test, finish_wal_recovery_test } from './pkg/opfs_jspi_example.js';
+import init, { run_tests, run_worker_tests, prepare_guard_connections, guarded_wait, take_guard_order, finish_guard_connections, enqueue_cleanup_probe, take_cleanup_order, prepare_deferred_rollback, drop_deferred_rollback, finish_deferred_rollback, prepare_recovery_test, finish_recovery_test, prepare_wal_recovery_test, finish_wal_recovery_test, prepare_worker_recovery_test, finish_worker_recovery_test, prepare_worker_wal_recovery_test, finish_worker_wal_recovery_test } from './pkg/opfs_jspi_example.js';
 if (new URLSearchParams(location.search).has('metrics')) {
     globalThis.__sqliteWasmVfsMetrics = [];
 }
@@ -23,7 +23,20 @@ try {
             throw new Error('WAL recovery hook did not reload');
         } else if (sessionStorage.getItem('jspi-recovery') === 'wal-pending') {
             sessionStorage.removeItem('jspi-recovery');
-            recovery = await finish_wal_recovery_test();
+            await finish_wal_recovery_test();
+            document.querySelector('#result').textContent = 'Testing interrupted worker journal…';
+            await prepare_worker_recovery_test();
+            throw new Error('worker recovery hook did not reload');
+        } else if (sessionStorage.getItem('jspi-recovery') === 'worker-pending') {
+            sessionStorage.removeItem('jspi-recovery');
+            await finish_worker_recovery_test();
+            document.querySelector('#result').textContent = 'Testing interrupted worker WAL checkpoint…';
+            await prepare_worker_wal_recovery_test();
+            throw new Error('worker WAL recovery hook did not reload');
+        } else if (sessionStorage.getItem('jspi-recovery') === 'worker-wal-pending') {
+            sessionStorage.removeItem('jspi-recovery');
+            const workerRecovery = await finish_worker_wal_recovery_test();
+            recovery = `PASS: legacy journal and WAL recovery after page termination\nPASS: worker journal recovery after page termination\n${workerRecovery}`;
         }
         await prepare_guard_connections();
         const first = guarded_wait('first', 40);
@@ -43,14 +56,17 @@ try {
         await prepare_deferred_rollback();
         drop_deferred_rollback();
         await finish_deferred_rollback();
+        document.querySelector('#result').textContent = 'Testing existing VFS…';
         const result = await run_tests();
+        document.querySelector('#result').textContent = 'Testing I/O worker VFS…';
+        const workerResult = await run_worker_tests();
         if (!recovery) {
             document.querySelector('#result').textContent = result + '\nTesting interrupted commit…';
             await prepare_recovery_test();
             throw new Error('recovery hook did not reload');
         }
         if (!ticks) throw new Error('event loop did not run during suspended I/O');
-        document.querySelector('#result').textContent = `${result}\nPASS: queued guard contention and nested deferred cleanup\n${recovery}\nEvent loop ticks during I/O: ${ticks}`;
+        document.querySelector('#result').textContent = `${result}\n${workerResult}\nPASS: queued guard contention and nested deferred cleanup\n${recovery}\nEvent loop ticks during I/O: ${ticks}`;
         document.documentElement.dataset.result = 'passed';
     } finally { clearInterval(timer); }
 } catch (error) {

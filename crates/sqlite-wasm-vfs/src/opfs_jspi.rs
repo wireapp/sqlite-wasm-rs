@@ -46,6 +46,8 @@ use wasm_bindgen::{prelude::wasm_bindgen, JsValue};
 extern "C" {
     #[wasm_bindgen(catch)]
     fn acquire(directory: &str) -> Result<Promise, JsValue>;
+    #[wasm_bindgen(catch, js_name = acquireWorker)]
+    fn acquire_worker(directory: &str) -> Result<Promise, JsValue>;
     #[wasm_bindgen(js_name = sleep)]
     fn sleep_js(milliseconds: f64) -> Promise;
     #[wasm_bindgen(catch)]
@@ -77,6 +79,18 @@ extern "C" {
     fn close_js(handle: &JsValue) -> Result<Promise, JsValue>;
     #[wasm_bindgen(js_name = scheduleSqliteCleanup)]
     fn schedule_cleanup(exports: &JsValue);
+}
+
+#[wasm_bindgen(module = "/src/opfs_jspi_worker_client.js")]
+extern "C" {
+    #[wasm_bindgen(js_name = clientProtocolVersion)]
+    fn worker_client_protocol_version() -> u32;
+}
+
+#[wasm_bindgen(module = "/src/opfs_jspi_io_worker.js")]
+extern "C" {
+    #[wasm_bindgen(js_name = protocolVersion)]
+    fn io_worker_protocol_version() -> u32;
 }
 
 static SQLITE: Mutex<()> = Mutex::new(());
@@ -260,6 +274,31 @@ pub fn install<C: OsCallback + Default + 'static>(
     directory: &str,
     default_vfs: bool,
 ) -> Result<OpfsJspi, InstallError> {
+    install_with_format::<C>(name, directory, default_vfs, false)
+}
+
+/// Installs an experimental JSPI VFS whose OPFS synchronous access handles
+/// live in an I/O-only worker. SQLite stays in the calling thread. The
+/// `worker-v1` namespace is separate from existing files and requires an
+/// explicit fresh-store choice; migration is not implemented.
+pub fn install_worker<C: OsCallback + Default + 'static>(
+    name: &str,
+    directory: &str,
+    default_vfs: bool,
+) -> Result<OpfsJspi, InstallError> {
+    assert_eq!(
+        worker_client_protocol_version(),
+        io_worker_protocol_version()
+    );
+    install_with_format::<C>(name, directory, default_vfs, true)
+}
+
+fn install_with_format<C: OsCallback + Default + 'static>(
+    name: &str,
+    directory: &str,
+    default_vfs: bool,
+    worker: bool,
+) -> Result<OpfsJspi, InstallError> {
     if name.is_empty() {
         return Err(RegisterVfsError::EmptyName.into());
     }
@@ -279,7 +318,12 @@ pub fn install<C: OsCallback + Default + 'static>(
     {
         return Err(error(VfsErrorCode::CantOpen, "invalid OPFS directory").into());
     }
-    let lease = Lease(settle(acquire(&parts.join("/")), VfsErrorCode::CantOpen)?);
+    let acquire_result = if worker {
+        acquire_worker(&parts.join("/"))
+    } else {
+        acquire(&parts.join("/"))
+    };
+    let lease = Lease(settle(acquire_result, VfsErrorCode::CantOpen)?);
     let state = Rc::new(State {
         lease,
         os: Box::new(JspiOs(C::default())),

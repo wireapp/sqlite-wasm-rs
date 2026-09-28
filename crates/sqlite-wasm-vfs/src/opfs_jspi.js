@@ -1,3 +1,5 @@
+import * as workerBackend from './opfs_jspi_worker_client.js';
+
 // Each VFS owns a dedicated directory. All clients of that directory must use
 // this Web Lock protocol; it does not exclude unrelated OPFS users.
 export async function acquire(directory) {
@@ -31,7 +33,32 @@ export async function acquire(directory) {
     }
 }
 
-export function release(lease) { lease.release(); return lease.finished; }
+export async function acquireWorker(directory) {
+    const lease = await acquire(directory);
+    try {
+        // The prototype has no format migration. Refuse a legacy namespace so
+        // selecting the worker cannot make an existing database look empty.
+        for await (const [name] of lease.root.entries()) {
+            if (name.startsWith('f-')) {
+                throw new Error('legacy OPFS files require migration before worker VFS installation');
+            }
+        }
+        await workerBackend.start(lease, directory);
+        lease.worker = true;
+        return lease;
+    } catch (error) {
+        if (lease.ioWorker) lease.ioWorker.terminate();
+        lease.release();
+        await lease.finished;
+        throw error;
+    }
+}
+
+export async function release(lease) {
+    try { if (lease.worker) await workerBackend.release(lease); }
+    finally { lease.release(); }
+    return lease.finished;
+}
 
 // Opt-in, in-memory I/O samples. Callers set this to an array and read it once
 // after timing; samples contain sizes and roles, never file contents or names.
@@ -62,6 +89,7 @@ async function measureStreamOperation(state, operation, details, action) {
 }
 
 export async function open(lease, name, create, exclusive, role, group) {
+    if (lease.worker) return workerBackend.open(lease, name, create, exclusive, role, group);
     if (exclusive && await exists(lease, name)) {
         throw new DOMException('File already exists', 'InvalidModificationError');
     }
@@ -83,6 +111,7 @@ export async function open(lease, name, create, exclusive, role, group) {
 }
 
 export async function exists(lease, name) {
+    if (lease.worker) return workerBackend.exists(lease, name);
     try {
         await lease.root.getFileHandle(name);
         return true;
@@ -112,6 +141,11 @@ export async function remove(lease, name) {
     // Metadata recorded at xOpen scopes ordinary sidecars without guessing from
     // an encoded filename. Unknown and super-journal deletes stay conservative.
     await deletionBarrier(lease, lease.metadata.get(name));
+    if (lease.worker) {
+        await workerBackend.remove(lease, name);
+        lease.metadata.delete(name);
+        return;
+    }
     await lease.root.removeEntry(name);
     lease.metadata.delete(name);
 }
@@ -258,6 +292,7 @@ async function submit(state) {
 }
 
 function hasPending(state) {
+    if (state.worker) return workerBackend.hasPending(state);
     return state.stream || state.sizeDirty || state.dirty.length;
 }
 
@@ -282,6 +317,7 @@ function invalidatePublishedCache(state) {
 }
 
 async function publish(state, reason) {
+    if (state.worker) return workerBackend.publish(state, reason);
     check(state);
     if (!hasPending(state)) return;
     const started = metricStart();
@@ -390,6 +426,7 @@ async function readPublished(state, target, start, end, targetOffset) {
 }
 
 export async function read(state, offset, length) {
+    if (state.worker) return workerBackend.read(state, offset, length);
     check(state);
     const started = metricStart();
     const count = Math.max(0, Math.min(length, state.logicalSize - offset));
@@ -423,6 +460,7 @@ export function size(state) {
 export async function write(state, offset, bytes) {
     check(state);
     await phaseBarrier(state);
+    if (state.worker) return workerBackend.write(state, offset, bytes);
     // Rust passes Uint8Array::from(&[u8]), which is already an owned JS copy.
     // It remains valid across this and later JSPI suspensions.
     try {
@@ -444,6 +482,20 @@ export async function write(state, offset, bytes) {
 export async function truncate(state, length) {
     check(state);
     await phaseBarrier(state);
+    if (state.worker) {
+        const previousSize = state.logicalSize;
+        if (state.role === 'wal' && length === 0 && previousSize !== 0 &&
+            globalThis.__sqliteWasmVfsFailWalTruncate) {
+            delete globalThis.__sqliteWasmVfsFailWalTruncate;
+            globalThis.__sqliteWasmVfsWalTruncateFired = true;
+            throw new DOMException('injected worker checkpoint truncate failure', 'UnknownError');
+        }
+        workerBackend.truncate(state, length);
+        if (state.role === 'wal' && length === 0 && previousSize !== 0) {
+            await publish(state, 'truncate');
+        }
+        return;
+    }
     try {
         const previousSize = state.logicalSize;
         if (length < state.logicalSize) {
@@ -474,6 +526,13 @@ export async function truncate(state, length) {
 export function sync(state) { return publish(state, 'sync'); }
 
 export async function close(state) {
+    if (state.worker) {
+        try {
+            await phaseBarrier(state);
+            await publish(state, 'close');
+        } finally { await workerBackend.close(state); }
+        return;
+    }
     try {
         await phaseBarrier(state);
         await publish(state, 'close');

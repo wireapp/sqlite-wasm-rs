@@ -196,6 +196,204 @@ pub fn run_tests() -> Result<String, JsValue> {
     Ok("PASS: indexed byte I/O, cache preservation, sparse/overlap/truncation, create/write/truncate/close errors, scoped and super-journal barriers, read-only, delete-on-close, main-thread SQLite, DELETE/TRUNCATE/PERSIST/WAL, checkpoint, rollback, reopen, integrity, duplicate opens, directory lease, uninstall/reinstall".into())
 }
 
+#[wasm_bindgen(jspi)]
+pub fn run_worker_tests() -> Result<String, JsValue> {
+    use rsqlite_vfs::ffi::*;
+    use std::mem::MaybeUninit;
+
+    let _sqlite = SqliteGuard::lock();
+    let mut vfs = opfs_jspi::install_worker::<ffi::WasmOsCallback>(
+        "jspi-example",
+        "sqlite-wasm-jspi-worker-example",
+        false,
+    )
+    .map_err(js_error)?;
+    assert!(opfs_jspi::install::<ffi::WasmOsCallback>(
+        "conflicting-vfs",
+        "sqlite-wasm-jspi-worker-example",
+        false,
+    )
+    .is_err());
+    unsafe {
+        let sqlite_vfs = sqlite3_vfs_find(c"jspi-example".as_ptr());
+        let mut storage = Box::new(MaybeUninit::<rsqlite_vfs::SQLiteVfsFile>::zeroed());
+        let file: *mut sqlite3_file = storage.as_mut_ptr().cast();
+        let mut actual = 0;
+        assert_eq!(
+            (*sqlite_vfs).xOpen.unwrap()(
+                sqlite_vfs,
+                c"worker-contract".as_ptr(),
+                file,
+                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_MAIN_JOURNAL,
+                &mut actual,
+            ),
+            SQLITE_OK
+        );
+        let methods = &*(*file).pMethods;
+        let write = methods.xWrite.unwrap();
+        let read = methods.xRead.unwrap();
+        let sync = methods.xSync.unwrap();
+        let truncate = methods.xTruncate.unwrap();
+        let initial = vec![7u8; 2 * 1024 * 1024];
+        assert_eq!(
+            write(file, initial.as_ptr().cast(), initial.len() as i32, 0),
+            SQLITE_OK
+        );
+        assert_eq!(sync(file, SQLITE_SYNC_FULL), SQLITE_OK);
+        let mut other_storage = Box::new(MaybeUninit::<rsqlite_vfs::SQLiteVfsFile>::zeroed());
+        let other: *mut sqlite3_file = other_storage.as_mut_ptr().cast();
+        assert_eq!(
+            (*sqlite_vfs).xOpen.unwrap()(
+                sqlite_vfs,
+                c"worker-contract".as_ptr(),
+                other,
+                SQLITE_OPEN_READWRITE | SQLITE_OPEN_MAIN_JOURNAL,
+                &mut actual,
+            ),
+            SQLITE_OK
+        );
+        let other_methods = &*(*other).pMethods;
+        let mut previous = [0u8; 1];
+        assert_eq!(
+            other_methods.xRead.unwrap()(
+                other,
+                previous.as_mut_ptr().cast(),
+                1,
+                (64 * 1024 - 1) as i64
+            ),
+            SQLITE_OK
+        );
+        assert_eq!(previous, [7]);
+        start_vfs_metrics();
+        assert_eq!(sync(file, SQLITE_SYNC_FULL), SQLITE_OK);
+        assert_eq!(
+            write(file, b"X".as_ptr().cast(), 1, (64 * 1024 - 1) as i64),
+            SQLITE_OK
+        );
+        assert_eq!(sync(file, SQLITE_SYNC_FULL), SQLITE_OK);
+        assert_eq!(
+            take_worker_published_bytes(),
+            1,
+            "small update copied more than its dirty byte"
+        );
+        assert_eq!(
+            other_methods.xRead.unwrap()(
+                other,
+                previous.as_mut_ptr().cast(),
+                1,
+                (64 * 1024 - 1) as i64
+            ),
+            SQLITE_OK
+        );
+        assert_eq!(
+            previous,
+            [b'X'],
+            "second handle retained a stale cached block"
+        );
+        let mut boundary = [0u8; 3];
+        assert_eq!(
+            read(
+                file,
+                boundary.as_mut_ptr().cast(),
+                3,
+                (64 * 1024 - 2) as i64
+            ),
+            SQLITE_OK
+        );
+        assert_eq!(boundary, [7, b'X', 7]);
+        assert_eq!(truncate(file, 64 * 1024 + 10), SQLITE_OK);
+        assert_eq!(truncate(file, 64 * 1024 * 3), SQLITE_OK);
+        assert_eq!(
+            write(file, b"Z".as_ptr().cast(), 1, (64 * 1024 * 2 + 1) as i64),
+            SQLITE_OK
+        );
+        assert_eq!(sync(file, SQLITE_SYNC_FULL), SQLITE_OK);
+        let mut tail = [255u8; 3];
+        assert_eq!(
+            read(file, tail.as_mut_ptr().cast(), 3, (64 * 1024 * 2) as i64),
+            SQLITE_OK
+        );
+        assert_eq!(tail, [0, b'Z', 0]);
+        assert_eq!(other_methods.xClose.unwrap()(other), SQLITE_OK);
+        assert_eq!(methods.xClose.unwrap()(file), SQLITE_OK);
+        vfs.remove("worker-contract").map_err(js_error)?;
+    }
+    for mode in ["DELETE", "WAL"] {
+        let name = format!("worker-{mode}.db");
+        let db = Db::open(&name)?;
+        assert_eq!(
+            db.scalar(&format!("PRAGMA journal_mode={mode}"))?,
+            mode.to_lowercase()
+        );
+        db.exec("PRAGMA synchronous=FULL; CREATE TABLE data(value TEXT); INSERT INTO data VALUES ('before');")?;
+        db.exec("UPDATE data SET value='after'")?;
+        assert_eq!(db.scalar("PRAGMA integrity_check")?, "ok");
+        if mode == "WAL" {
+            fail_worker_wal_truncate();
+            assert!(db.scalar("PRAGMA wal_checkpoint(TRUNCATE)").is_err());
+            assert!(take_worker_wal_truncate_fired());
+            drop(db);
+            let db = Db::open(&name)?;
+            assert_eq!(db.scalar("PRAGMA wal_checkpoint(TRUNCATE)")?, "0");
+            db.exec("UPDATE data SET value='after checkpoint'")?;
+            drop(db);
+        } else {
+            drop(db);
+        }
+        let db = Db::open(&name)?;
+        assert_eq!(
+            db.scalar("SELECT value FROM data")?,
+            if mode == "WAL" {
+                "after checkpoint"
+            } else {
+                "after"
+            }
+        );
+        assert_eq!(db.scalar("PRAGMA integrity_check")?, "ok");
+        drop(db);
+        vfs.remove(&name).map_err(js_error)?;
+        for suffix in ["-journal", "-wal"] {
+            let sidecar = format!("{name}{suffix}");
+            if vfs.contains(&sidecar).map_err(js_error)? {
+                vfs.remove(&sidecar).map_err(js_error)?;
+            }
+        }
+    }
+    unsafe {
+        vfs.uninstall().map_err(js_error)?;
+    }
+    let mut legacy = opfs_jspi::install::<ffi::WasmOsCallback>(
+        "jspi-example",
+        "sqlite-wasm-jspi-worker-example",
+        false,
+    )
+    .map_err(js_error)?;
+    drop(Db::open("format-gate.db")?);
+    unsafe {
+        legacy.uninstall().map_err(js_error)?;
+    }
+    assert!(
+        opfs_jspi::install_worker::<ffi::WasmOsCallback>(
+            "jspi-example",
+            "sqlite-wasm-jspi-worker-example",
+            false,
+        )
+        .is_err(),
+        "worker format must reject unmigrated legacy files"
+    );
+    let mut legacy = opfs_jspi::install::<ffi::WasmOsCallback>(
+        "jspi-example",
+        "sqlite-wasm-jspi-worker-example",
+        false,
+    )
+    .map_err(js_error)?;
+    legacy.remove("format-gate.db").map_err(js_error)?;
+    unsafe {
+        legacy.uninstall().map_err(js_error)?;
+    }
+    Ok("PASS: I/O-only worker dirty-byte sync, sparse/shrink, DELETE/WAL, checkpoint failure/retry, reopen, integrity, format gate".into())
+}
+
 #[wasm_bindgen(module = "/test-hooks.js")]
 extern "C" {
     #[wasm_bindgen(js_name = startVfsMetrics)]
@@ -204,6 +402,14 @@ extern "C" {
     fn take_vfs_metric_operations() -> String;
     #[wasm_bindgen(js_name = takeVfsMetricOutcomes)]
     fn take_vfs_metric_outcomes() -> String;
+    #[wasm_bindgen(js_name = takeWorkerPublishedBytes)]
+    fn take_worker_published_bytes() -> u32;
+    #[wasm_bindgen(js_name = crashAfterWorkerDatabasePublish)]
+    fn crash_after_worker_database_publish(stage: &str);
+    #[wasm_bindgen(js_name = failWorkerWalTruncate)]
+    fn fail_worker_wal_truncate();
+    #[wasm_bindgen(js_name = takeWorkerWalTruncateFired)]
+    fn take_worker_wal_truncate_fired() -> bool;
     #[wasm_bindgen(js_name = startColdReadCount)]
     fn start_cold_read_count();
     #[wasm_bindgen(js_name = takeColdReadCount)]
@@ -893,4 +1099,88 @@ pub fn finish_wal_recovery_test() -> Result<String, JsValue> {
         vfs.uninstall().map_err(js_error)?;
     }
     Ok("PASS: persistent WAL recovery after page termination during checkpoint".into())
+}
+
+#[wasm_bindgen(jspi)]
+pub fn prepare_worker_recovery_test() -> Result<(), JsValue> {
+    let _sqlite = SqliteGuard::lock();
+    let _vfs = opfs_jspi::install_worker::<ffi::WasmOsCallback>(
+        "jspi-example",
+        "sqlite-wasm-jspi-worker-example",
+        false,
+    )
+    .map_err(js_error)?;
+    let db = Db::open("worker-recovery.db")?;
+    db.exec("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; DROP TABLE IF EXISTS data; CREATE TABLE data(value); INSERT INTO data VALUES ('before interruption');")?;
+    crash_after_worker_database_publish("worker-pending");
+    db.exec("UPDATE data SET value='uncommitted';")?;
+    Err(js_error("worker crash hook did not run"))
+}
+
+#[wasm_bindgen(jspi)]
+pub fn finish_worker_recovery_test() -> Result<String, JsValue> {
+    let _sqlite = SqliteGuard::lock();
+    let mut vfs = opfs_jspi::install_worker::<ffi::WasmOsCallback>(
+        "jspi-example",
+        "sqlite-wasm-jspi-worker-example",
+        false,
+    )
+    .map_err(js_error)?;
+    assert!(vfs
+        .contains("worker-recovery.db-journal")
+        .map_err(js_error)?);
+    let db = Db::open("worker-recovery.db")?;
+    assert_eq!(db.scalar("SELECT value FROM data")?, "before interruption");
+    assert_eq!(db.scalar("PRAGMA integrity_check")?, "ok");
+    drop(db);
+    vfs.remove("worker-recovery.db").map_err(js_error)?;
+    unsafe {
+        vfs.uninstall().map_err(js_error)?;
+    }
+    Ok("PASS: worker hot-journal recovery after page termination".into())
+}
+
+#[wasm_bindgen(jspi)]
+pub fn prepare_worker_wal_recovery_test() -> Result<(), JsValue> {
+    let _sqlite = SqliteGuard::lock();
+    let _vfs = opfs_jspi::install_worker::<ffi::WasmOsCallback>(
+        "jspi-example",
+        "sqlite-wasm-jspi-worker-example",
+        false,
+    )
+    .map_err(js_error)?;
+    let db = Db::open("worker-wal-recovery.db")?;
+    assert_eq!(db.scalar("PRAGMA journal_mode=WAL")?, "wal");
+    db.exec("PRAGMA synchronous=FULL; PRAGMA wal_autocheckpoint=0; DROP TABLE IF EXISTS data; CREATE TABLE data(value); INSERT INTO data VALUES ('committed before interruption');")?;
+    crash_after_worker_database_publish("worker-wal-pending");
+    db.exec("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    Err(js_error("worker WAL crash hook did not run"))
+}
+
+#[wasm_bindgen(jspi)]
+pub fn finish_worker_wal_recovery_test() -> Result<String, JsValue> {
+    let _sqlite = SqliteGuard::lock();
+    let mut vfs = opfs_jspi::install_worker::<ffi::WasmOsCallback>(
+        "jspi-example",
+        "sqlite-wasm-jspi-worker-example",
+        false,
+    )
+    .map_err(js_error)?;
+    assert!(vfs
+        .contains("worker-wal-recovery.db-wal")
+        .map_err(js_error)?);
+    let db = Db::open("worker-wal-recovery.db")?;
+    assert_eq!(
+        db.scalar("SELECT value FROM data")?,
+        "committed before interruption"
+    );
+    assert_eq!(db.scalar("PRAGMA integrity_check")?, "ok");
+    assert_eq!(db.scalar("PRAGMA wal_checkpoint(TRUNCATE)")?, "0");
+    db.exec("INSERT INTO data VALUES ('after recovery')")?;
+    drop(db);
+    vfs.remove("worker-wal-recovery.db").map_err(js_error)?;
+    unsafe {
+        vfs.uninstall().map_err(js_error)?;
+    }
+    Ok("PASS: worker WAL recovery after page termination during checkpoint".into())
 }
