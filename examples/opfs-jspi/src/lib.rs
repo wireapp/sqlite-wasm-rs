@@ -101,6 +101,7 @@ pub fn run_tests() -> Result<String, JsValue> {
     .map_err(js_error)?;
     file_contract_tests();
     cache_contract_tests();
+    wal_truncate_contract_tests();
     assert!(Db::open("../invalid").is_err());
     for mode in ["DELETE", "TRUNCATE", "PERSIST", "WAL"] {
         let name = format!("{mode}.db");
@@ -532,6 +533,48 @@ fn cache_contract_tests() {
         ] {
             assert!(metrics.contains(operation), "missing {operation} metric");
         }
+    }
+}
+
+fn wal_truncate_contract_tests() {
+    use rsqlite_vfs::ffi::*;
+    use std::mem::MaybeUninit;
+
+    unsafe {
+        let vfs = sqlite3_vfs_find(c"jspi-example".as_ptr());
+        let mut storage = Box::new(MaybeUninit::<rsqlite_vfs::SQLiteVfsFile>::zeroed());
+        let file: *mut sqlite3_file = storage.as_mut_ptr().cast();
+        let mut actual = 0;
+        assert_eq!(
+            (*vfs).xOpen.unwrap()(
+                vfs,
+                c"wal-truncate".as_ptr(),
+                file,
+                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_WAL,
+                &mut actual,
+            ),
+            SQLITE_OK
+        );
+        let methods = &*(*file).pMethods;
+        assert_eq!(
+            methods.xWrite.unwrap()(file, b"wal".as_ptr().cast(), 3, 0),
+            SQLITE_OK
+        );
+        assert_eq!(methods.xSync.unwrap()(file, SQLITE_SYNC_FULL), SQLITE_OK);
+
+        start_vfs_metrics();
+        assert_eq!(methods.xTruncate.unwrap()(file, 0), SQLITE_OK);
+        let operations = take_vfs_metric_operations();
+        assert!(operations.contains("streamTruncate"), "{operations}");
+        assert!(operations.contains("publish:truncate"), "{operations}");
+        let mut size = -1;
+        assert_eq!(methods.xFileSize.unwrap()(file, &mut size), SQLITE_OK);
+        assert_eq!(size, 0);
+        assert_eq!(methods.xClose.unwrap()(file), SQLITE_OK);
+        assert_eq!(
+            (*vfs).xDelete.unwrap()(vfs, c"wal-truncate".as_ptr(), 1),
+            SQLITE_OK
+        );
     }
 }
 

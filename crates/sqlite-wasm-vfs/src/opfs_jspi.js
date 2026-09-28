@@ -445,6 +445,7 @@ export async function truncate(state, length) {
     check(state);
     await phaseBarrier(state);
     try {
+        const previousSize = state.logicalSize;
         if (length < state.logicalSize) {
             state.publicationTailFloor = Math.min(state.publicationTailFloor ?? length, length);
             state.baseLimit = Math.min(state.baseLimit, length);
@@ -457,6 +458,12 @@ export async function truncate(state, length) {
         }
         state.logicalSize = length;
         state.sizeDirty = true;
+        // SQLite's TRUNCATE checkpoint does not necessarily call xSync after
+        // xTruncate on the WAL. Publish its zero length before reporting that
+        // the checkpoint has completed, after the database phase barrier.
+        if (state.role === 'wal' && length === 0 && previousSize !== 0) {
+            await publish(state, 'truncate');
+        }
     } catch (error) {
         if (state.stream) await poison(state, error);
         state.failed = error;
