@@ -201,6 +201,8 @@ extern "C" {
     fn start_vfs_metrics();
     #[wasm_bindgen(js_name = takeVfsMetricOperations)]
     fn take_vfs_metric_operations() -> String;
+    #[wasm_bindgen(js_name = takeVfsMetricOutcomes)]
+    fn take_vfs_metric_outcomes() -> String;
     #[wasm_bindgen(js_name = startColdReadCount)]
     fn start_cold_read_count();
     #[wasm_bindgen(js_name = takeColdReadCount)]
@@ -386,13 +388,13 @@ fn cache_contract_tests() {
             SQLITE_OK
         );
         assert_eq!(sync(file, SQLITE_SYNC_FULL), SQLITE_OK);
-        for offset in [0, BLOCK + 10, BLOCK * 2] {
+        for (offset, expected) in [(0, 1), (BLOCK + 10, b'Z'), (BLOCK * 2, 3)] {
             assert_eq!(
                 read(file, byte.as_mut_ptr().cast(), 1, offset as i64),
                 SQLITE_OK
             );
+            assert_eq!(byte, [expected]);
         }
-        assert_eq!(byte, [3]);
         assert_eq!(
             take_cold_read_count(),
             1,
@@ -404,11 +406,12 @@ fn cache_contract_tests() {
             SQLITE_OK
         );
         assert_eq!(sync(file, SQLITE_SYNC_FULL), SQLITE_OK);
-        for offset in [BLOCK - 1, BLOCK, BLOCK * 2] {
+        for (offset, expected) in [(BLOCK - 1, b'X'), (BLOCK, b'Y'), (BLOCK * 2, 3)] {
             assert_eq!(
                 read(file, byte.as_mut_ptr().cast(), 1, offset as i64),
                 SQLITE_OK
             );
+            assert_eq!(byte, [expected]);
         }
         assert_eq!(
             take_cold_read_count(),
@@ -465,6 +468,12 @@ fn cache_contract_tests() {
             read(file, byte.as_mut_ptr().cast(), 1, BLOCK as i64),
             SQLITE_OK
         );
+        assert_eq!(byte, [b'Y']);
+        assert_eq!(
+            read(file, byte.as_mut_ptr().cast(), 1, (BLOCK * 4) as i64),
+            SQLITE_OK
+        );
+        assert_eq!(byte, [0]);
         take_cold_read_count();
         let large = vec![9u8; 1024 * 1024];
         assert_eq!(
@@ -476,6 +485,10 @@ fn cache_contract_tests() {
             ),
             SQLITE_OK
         );
+        assert_eq!(
+            write(file, b"7".as_ptr().cast(), 1, (BLOCK * 4 + 10) as i64),
+            SQLITE_OK
+        );
         assert_eq!(sync(file, SQLITE_SYNC_FULL), SQLITE_OK);
         assert_eq!(read(file, byte.as_mut_ptr().cast(), 1, 0), SQLITE_OK);
         assert_eq!(byte, [1]);
@@ -484,10 +497,21 @@ fn cache_contract_tests() {
             SQLITE_OK
         );
         assert_eq!(byte, [b'Y']);
+        let mut changed = [0u8; 12];
+        assert_eq!(
+            read(
+                file,
+                changed.as_mut_ptr().cast(),
+                changed.len() as i32,
+                (BLOCK * 4) as i64
+            ),
+            SQLITE_OK
+        );
+        assert_eq!(changed, [9, 9, 9, 9, 9, 9, 9, 9, 9, 9, b'7', 9]);
         assert_eq!(
             take_cold_read_count(),
-            0,
-            "submission before sync must retain unaffected blocks"
+            1,
+            "submission before sync must reload changed blocks and retain unaffected blocks"
         );
         stop_cold_read_count();
 
@@ -617,6 +641,7 @@ fn file_contract_tests() {
         );
         assert_eq!(found, 0);
 
+        start_vfs_metrics();
         assert_eq!(
             open(vfs, c"write-failure".as_ptr(), file, flags, &mut actual),
             SQLITE_OK
@@ -632,11 +657,15 @@ fn file_contract_tests() {
             SQLITE_IOERR_FSYNC
         );
         assert_eq!(methods.xClose.unwrap()(file), SQLITE_IOERR_CLOSE);
+        let outcomes = take_vfs_metric_outcomes();
+        assert!(outcomes.contains("streamWrite:false"), "{outcomes}");
+        assert!(outcomes.contains("publish:sync:false"), "{outcomes}");
         assert_eq!(
             (*vfs).xDelete.unwrap()(vfs, c"write-failure".as_ptr(), 1),
             SQLITE_OK
         );
 
+        start_vfs_metrics();
         assert_eq!(
             open(vfs, c"truncate-failure".as_ptr(), file, flags, &mut actual),
             SQLITE_OK
@@ -649,6 +678,9 @@ fn file_contract_tests() {
             SQLITE_IOERR_FSYNC
         );
         assert_eq!(methods.xClose.unwrap()(file), SQLITE_IOERR_CLOSE);
+        let outcomes = take_vfs_metric_outcomes();
+        assert!(outcomes.contains("streamTruncate:false"), "{outcomes}");
+        assert!(outcomes.contains("publish:sync:false"), "{outcomes}");
         assert_eq!(
             (*vfs).xDelete.unwrap()(vfs, c"truncate-failure".as_ptr(), 1),
             SQLITE_OK

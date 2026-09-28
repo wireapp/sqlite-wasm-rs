@@ -50,6 +50,17 @@ function recordMetric(state, operation, started, details = {}) {
     }
 }
 
+async function measureStreamOperation(state, operation, details, action) {
+    const started = metricStart();
+    try {
+        await action();
+        recordMetric(state, operation, started, { ...details, success: true });
+    } catch (error) {
+        recordMetric(state, operation, started, { ...details, success: false });
+        throw error;
+    }
+}
+
 export async function open(lease, name, create, exclusive, role, group) {
     if (exclusive && await exists(lease, name)) {
         throw new DOMException('File already exists', 'InvalidModificationError');
@@ -222,22 +233,19 @@ async function submit(state) {
         const stream = await ensureStream(state);
         let stagedSize = state.stagedSize;
         if (state.shrinkFloor !== undefined) {
-            const started = metricStart();
-            await stream.truncate(state.shrinkFloor);
-            recordMetric(state, 'streamTruncate', started, { length: state.shrinkFloor });
+            await measureStreamOperation(state, 'streamTruncate', { length: state.shrinkFloor },
+                () => stream.truncate(state.shrinkFloor));
             stagedSize = state.shrinkFloor;
         }
         if (state.sizeDirty && stagedSize !== state.logicalSize) {
-            const started = metricStart();
-            await stream.truncate(state.logicalSize);
-            recordMetric(state, 'streamTruncate', started, { length: state.logicalSize });
+            await measureStreamOperation(state, 'streamTruncate', { length: state.logicalSize },
+                () => stream.truncate(state.logicalSize));
             stagedSize = state.logicalSize;
         }
         for (const range of state.dirty) {
             const bytes = materialize(state, range.start, range.end);
-            const started = metricStart();
-            await stream.write({ type: 'write', position: range.start, data: bytes });
-            recordMetric(state, 'streamWrite', started, { bytes: bytes.byteLength });
+            await measureStreamOperation(state, 'streamWrite', { bytes: bytes.byteLength },
+                () => stream.write({ type: 'write', position: range.start, data: bytes }));
             stagedSize = Math.max(stagedSize, range.end);
         }
         state.stagedSize = state.logicalSize;
@@ -277,7 +285,12 @@ async function publish(state, reason) {
     check(state);
     if (!hasPending(state)) return;
     const started = metricStart();
-    await submit(state);
+    try {
+        await submit(state);
+    } catch (error) {
+        recordMetric(state, 'publish', started, { reason, logicalSize: state.logicalSize, success: false });
+        throw error;
+    }
     const stream = state.stream;
     if (!stream) return;
     const closeStarted = metricStart();
@@ -294,7 +307,7 @@ async function publish(state, reason) {
         recordMetric(state, 'publish', started, {
             reason, logicalSize: state.logicalSize,
             dirtyBytes: state.publicationChanges.reduce((sum, range) => sum + range.end - range.start, 0),
-            touchedChunks: null, evictedBlocks, cacheBytes: state.cacheBytes,
+            touchedChunks: null, evictedBlocks, cacheBytes: state.cacheBytes, success: true,
         });
         state.publicationChanges = [];
         state.publicationTailFloor = undefined;

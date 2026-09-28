@@ -16,6 +16,13 @@ export function takeVfsMetricOperations() {
     return samples.map(sample => sample.operation + (sample.reason ? ':' + sample.reason : '')).join(',');
 }
 
+export function takeVfsMetricOutcomes() {
+    const samples = globalThis.__sqliteWasmVfsMetrics.slice(metricStartIndex);
+    if (ownsMetricCollector) delete globalThis.__sqliteWasmVfsMetrics;
+    return samples.map(sample => sample.operation +
+        (sample.reason ? ':' + sample.reason : '') + ':' + sample.success).join(',');
+}
+
 export function startColdReadCount() {
     if (originalArrayBuffer) throw new Error('cold read counter already started');
     coldReads = 0;
